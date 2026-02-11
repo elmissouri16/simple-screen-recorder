@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Simple Screen Recorder
+Comment=Tray-based screen recorder using ffmpeg
+Icon=media-record
+Exec=simple-screen-recorder
+Terminal=false
+Categories=AudioVideo;Recorder;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
