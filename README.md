@@ -84,6 +84,12 @@ Available in tray menu -> `Settings`:
 - `Frames per second`
 - `Container`: `mkv` or `mp4` (`mkv` default)
 - `System audio`: on/off
+- `Mouse highlight`: show a cursor halo while recording
+- `Click effects`: show a ripple pulse on mouse clicks
+- `Highlight size`: halo diameter in pixels
+- `Highlight thickness`: ring thickness
+- `Highlight opacity`: halo visibility
+- `Highlight color`: halo color (hex or color picker)
 - `Audio source`: `auto` (recommended), `default`, or explicit source name
 - `Hotkey: toggle rec` (default: `<ctrl>+<alt>+r`)
 - `Hotkey: stop rec` (default: `<ctrl>+<alt>+s`)

@@ -10,6 +10,7 @@ from PyQt5.QtGui import QColor, QDesktopServices, QIcon, QPainter, QPixmap
 from PyQt5.QtWidgets import (
     QAction,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -29,7 +30,13 @@ from PyQt5.QtWidgets import (
 from simple_screen_recorder.config import CAPTURE_MODE_FULL, CAPTURE_MODE_WINDOW, RecorderConfig
 from simple_screen_recorder.ffmpeg_backend import FfmpegRecorder
 from simple_screen_recorder.hotkeys import HotkeyManager
+from simple_screen_recorder.mouse_highlight import MouseHighlightOverlay
 from simple_screen_recorder.window_select import select_window_id
+
+try:
+    from pynput import mouse as pynput_mouse
+except Exception:  # pragma: no cover - optional runtime feature
+    pynput_mouse = None
 
 APP_TITLE = "Simple Screen Recorder"
 
@@ -66,6 +73,46 @@ class SettingsDialog(QDialog):
         self.record_system_audio = QCheckBox("Enable system audio recording")
         self.record_system_audio.setChecked(config.record_system_audio)
 
+        self.highlight_mouse = QCheckBox("Highlight mouse cursor while recording")
+        self.highlight_mouse.setChecked(config.highlight_mouse)
+
+        self.click_effects = QCheckBox("Show click ripple effects")
+        self.click_effects.setChecked(config.mouse_click_effects)
+
+        self.highlight_size = QSpinBox()
+        self.highlight_size.setRange(40, 200)
+        self.highlight_size.setValue(config.mouse_highlight_size)
+
+        self.highlight_thickness = QSpinBox()
+        self.highlight_thickness.setRange(2, 16)
+        self.highlight_thickness.setValue(config.mouse_highlight_thickness)
+
+        self.highlight_opacity = QSpinBox()
+        self.highlight_opacity.setRange(10, 100)
+        self.highlight_opacity.setSuffix("%")
+        self.highlight_opacity.setValue(config.mouse_highlight_opacity)
+
+        self.highlight_color = QLineEdit(config.mouse_highlight_color)
+        self.highlight_color.setPlaceholderText("#F6C445")
+        color_button = QPushButton("Pick")
+        color_button.clicked.connect(self._choose_highlight_color)
+        color_widget = QWidget()
+        color_layout = QHBoxLayout()
+        color_layout.setContentsMargins(0, 0, 0, 0)
+        color_layout.addWidget(self.highlight_color)
+        color_layout.addWidget(color_button)
+        color_widget.setLayout(color_layout)
+        self._highlight_controls = [
+            self.click_effects,
+            self.highlight_size,
+            self.highlight_thickness,
+            self.highlight_opacity,
+            self.highlight_color,
+            color_button,
+        ]
+        self.highlight_mouse.toggled.connect(self._set_highlight_controls_enabled)
+        self._set_highlight_controls_enabled(config.highlight_mouse)
+
         self.audio_source = QLineEdit(config.audio_source)
         self.audio_source.setPlaceholderText("Pulse source (auto, default, or explicit source name)")
         self.audio_source.setEnabled(config.record_system_audio)
@@ -83,6 +130,12 @@ class SettingsDialog(QDialog):
         form.addRow("Frames per second", self.fps)
         form.addRow("Container", self.container)
         form.addRow("System audio", self.record_system_audio)
+        form.addRow("Mouse highlight", self.highlight_mouse)
+        form.addRow("Click effects", self.click_effects)
+        form.addRow("Highlight size", self.highlight_size)
+        form.addRow("Highlight thickness", self.highlight_thickness)
+        form.addRow("Highlight opacity", self.highlight_opacity)
+        form.addRow("Highlight color", color_widget)
         form.addRow("Audio source", self.audio_source)
         form.addRow("Hotkey: toggle rec", self.hotkey_toggle_recording)
         form.addRow("Hotkey: stop rec", self.hotkey_stop_recording)
@@ -101,6 +154,15 @@ class SettingsDialog(QDialog):
         if selected:
             self.output_dir.setText(selected)
 
+    def _set_highlight_controls_enabled(self, enabled: bool) -> None:
+        for widget in self._highlight_controls:
+            widget.setEnabled(enabled)
+
+    def _choose_highlight_color(self) -> None:
+        initial = QColorDialog.getColor(QColor(self.highlight_color.text().strip() or "#F6C445"), self)
+        if initial.isValid():
+            self.highlight_color.setText(initial.name().upper())
+
     def build_config(self) -> RecorderConfig:
         return RecorderConfig(
             output_dir=self.output_dir.text().strip(),
@@ -108,6 +170,12 @@ class SettingsDialog(QDialog):
             fps=self.fps.value(),
             container=self.container.currentText(),
             record_system_audio=self.record_system_audio.isChecked(),
+            highlight_mouse=self.highlight_mouse.isChecked(),
+            mouse_click_effects=self.click_effects.isChecked(),
+            mouse_highlight_size=self.highlight_size.value(),
+            mouse_highlight_thickness=self.highlight_thickness.value(),
+            mouse_highlight_opacity=self.highlight_opacity.value(),
+            mouse_highlight_color=self.highlight_color.text().strip() or "#F6C445",
             audio_source=self.audio_source.text().strip() or "auto",
             hotkey_toggle_recording=self.hotkey_toggle_recording.text().strip() or "<ctrl>+<alt>+r",
             hotkey_stop_recording=self.hotkey_stop_recording.text().strip() or "<ctrl>+<alt>+s",
@@ -117,6 +185,7 @@ class SettingsDialog(QDialog):
 class TrayRecorderApp(QObject):
     hotkey_toggle_signal = pyqtSignal()
     hotkey_stop_signal = pyqtSignal()
+    mouse_click_signal = pyqtSignal(str)
 
     def __init__(self, qt_app) -> None:
         super().__init__()
@@ -124,6 +193,14 @@ class TrayRecorderApp(QObject):
         self.config = RecorderConfig.load()
         self.recorder = FfmpegRecorder()
         self.hotkeys = HotkeyManager(self._emit_hotkey_toggle, self._emit_hotkey_stop)
+        self._mouse_click_listener: Optional[object] = None
+        self.mouse_highlight_overlay = MouseHighlightOverlay(
+            diameter=self.config.mouse_highlight_size,
+            ring_thickness=self.config.mouse_highlight_thickness,
+            opacity=self.config.mouse_highlight_opacity,
+            color=self.config.mouse_highlight_color,
+        )
+        self.mouse_highlight_overlay.set_click_effects_enabled(self.config.mouse_click_effects)
         self.current_output_path: Optional[Path] = None
 
         self.idle_icon = self._load_state_icon(recording=False)
@@ -164,12 +241,16 @@ class TrayRecorderApp(QObject):
         self._update_actions()
         self.hotkey_toggle_signal.connect(self._on_hotkey_toggle)
         self.hotkey_stop_signal.connect(self._on_hotkey_stop)
+        self.mouse_click_signal.connect(self._on_mouse_click_effect)
         self._register_hotkeys()
+        self._start_mouse_click_listener()
 
         if not self.recorder.is_ffmpeg_available():
             self._error("ffmpeg is not available on PATH. Install ffmpeg first.")
         if self._is_wayland():
             self._warn("Wayland session detected. This version currently supports X11 capture only.")
+        if pynput_mouse is None and self.config.mouse_click_effects:
+            self._warn("Click effects are unavailable (pynput mouse listener could not be loaded).")
 
     def _load_icon_from_assets(self, candidates: list[str]) -> QIcon:
         base_dir = Path(__file__).resolve().parent / "assets"
@@ -268,6 +349,42 @@ class TrayRecorderApp(QObject):
         if self.recorder.is_recording:
             self.stop_recording()
 
+    def _start_mouse_click_listener(self) -> None:
+        if pynput_mouse is None or self._mouse_click_listener is not None:
+            return
+
+        def _on_click(_x, _y, button, pressed) -> None:
+            if not pressed:
+                return
+            button_name = getattr(button, "name", str(button))
+            self.mouse_click_signal.emit(button_name)
+
+        try:
+            listener = pynput_mouse.Listener(on_click=_on_click)
+            listener.start()
+            self._mouse_click_listener = listener
+        except Exception as exc:
+            self._mouse_click_listener = None
+            self._warn(f"Could not start click effects listener: {exc}")
+
+    def _stop_mouse_click_listener(self) -> None:
+        if self._mouse_click_listener is None:
+            return
+        try:
+            self._mouse_click_listener.stop()
+        except Exception:
+            pass
+        self._mouse_click_listener = None
+
+    def _on_mouse_click_effect(self, button_name: str) -> None:
+        if not self.recorder.is_recording:
+            return
+        if not self.config.highlight_mouse:
+            return
+        if not self.config.mouse_click_effects:
+            return
+        self.mouse_highlight_overlay.trigger_click_effect(button_name)
+
     def _register_hotkeys(self) -> None:
         ok, message = self.hotkeys.start(
             self.config.hotkey_toggle_recording,
@@ -309,11 +426,23 @@ class TrayRecorderApp(QObject):
             return
 
         self.current_output_path = output_path
+        self.mouse_highlight_overlay.apply_style(
+            diameter=self.config.mouse_highlight_size,
+            ring_thickness=self.config.mouse_highlight_thickness,
+            opacity=self.config.mouse_highlight_opacity,
+            color=self.config.mouse_highlight_color,
+        )
+        self.mouse_highlight_overlay.set_click_effects_enabled(self.config.mouse_click_effects)
+        if self.config.highlight_mouse:
+            self.mouse_highlight_overlay.start()
+        else:
+            self.mouse_highlight_overlay.stop()
         self._update_actions()
         self._info(f"Recording started: {output_path.name}")
 
     def stop_recording(self) -> None:
         stopped, message = self.recorder.stop()
+        self.mouse_highlight_overlay.stop()
         self._update_actions()
 
         if not stopped:
@@ -337,6 +466,18 @@ class TrayRecorderApp(QObject):
         updated = dialog.build_config()._validated()
         self.config = updated
         self.config.save()
+        self.mouse_highlight_overlay.apply_style(
+            diameter=self.config.mouse_highlight_size,
+            ring_thickness=self.config.mouse_highlight_thickness,
+            opacity=self.config.mouse_highlight_opacity,
+            color=self.config.mouse_highlight_color,
+        )
+        self.mouse_highlight_overlay.set_click_effects_enabled(self.config.mouse_click_effects)
+        if self.recorder.is_recording:
+            if self.config.highlight_mouse:
+                self.mouse_highlight_overlay.start()
+            else:
+                self.mouse_highlight_overlay.stop()
         self._register_hotkeys()
         self._info("Settings saved.")
 
@@ -346,6 +487,8 @@ class TrayRecorderApp(QObject):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     def quit_app(self) -> None:
+        self.mouse_highlight_overlay.stop()
+        self._stop_mouse_click_listener()
         if self.recorder.is_recording:
             self.stop_recording()
         self.hotkeys.stop()
